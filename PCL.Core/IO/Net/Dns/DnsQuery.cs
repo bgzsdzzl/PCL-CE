@@ -64,11 +64,13 @@ public class DnsQuery : IDisposable
         }
         catch (OperationCanceledException) when (!cts.IsCancellationRequested)
         {
+            // 仅 DoH 超时（非调用方取消）：交由调用方按需回退
             LogWrapper.Warn(ModuleName, $"DoH query timeout for {host}, use system default DNS");
             return null;
         }
-        catch (TaskCanceledException)
+        catch (OperationCanceledException)
         {
+            // 调用方主动取消：必须向上传播，不能被吞成"无结果"
             throw;
         }
         catch (Exception ex)
@@ -88,19 +90,43 @@ public class DnsQuery : IDisposable
             ]
         );
 
-        if (queryResponse.All(static x => x is null))
-        {
-            LogWrapper.Warn(ModuleName, $"Failed to query IP for host {host} using DoH, use system default DNS");
-            return await System.Net.Dns.GetHostAddressesAsync(host, cts);
-        }
+        // 任一地址族查询失败/超时：整体回落系统 DNS，
+        // 避免遗漏仅通过该地址族可达的主机
+        if (queryResponse.Any(static x => x is null))
+            return await _SystemResolveAsync(host, cts);
 
-        return queryResponse.Where(static x => x is not null)
+        var addresses = queryResponse
+            .Where(static x => x is not null)
             .SelectMany(static x => x!.Answers)
             .Where(static x => x.Type is DnsQueryType.A or DnsQueryType.AAAA)
             .Select(static x => x.Resource as DnsIpAddressResource)
             .Where(static x => x is not null)
             .Select(static x => x!.IPAddress)
             .ToArray();
+
+        // DoH 成功应答但无任何地址记录（域名不存在或无 A/AAAA）：
+        // 回退系统 DNS 判定，避免把 NXDOMAIN 误报为"解析成功但无地址"
+        if (addresses.Length == 0)
+            return await _SystemResolveAsync(host, cts);
+
+        return addresses;
+    }
+
+    private static async Task<IPAddress[]> _SystemResolveAsync(string host, CancellationToken ct)
+    {
+        try
+        {
+            return await System.Net.Dns.GetHostAddressesAsync(host, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogWrapper.Warn(ModuleName, $"System DNS resolution failed for {host}: {ex.Message}");
+            return [];
+        }
     }
 
     public void Dispose()
